@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mateothegreat/go-multilog/multilog"
 	red "github.com/redis/go-redis/v9"
 
 	"github.com/notioncodes/client"
@@ -20,6 +21,9 @@ type Service struct {
 	Plugin      *RedisPlugin
 	transformer *Transformer
 	result      *ExportResult
+	wg          sync.WaitGroup
+	objCh       chan interface{}
+	resCh       chan workResult
 }
 
 // NewService creates a new Redis service instance.
@@ -47,7 +51,6 @@ func NewService(plugin *RedisPlugin) (*Service, error) {
 // - The export result.
 // - An error if the export operation fails.
 func (s *Service) ExportAll(ctx context.Context) (*ExportResult, error) {
-	// Export databases.
 	databases, err := s.getAllDatabases(ctx)
 	if err != nil {
 		return s.result, fmt.Errorf("failed to get databases: %w", err)
@@ -62,42 +65,56 @@ func (s *Service) ExportAll(ctx context.Context) (*ExportResult, error) {
 	// 	s.mergeResults(s.result, dbResult)
 	// }
 
+	wg := sync.WaitGroup{}
+
 	// Export pages from each database if enabled.
 	if contains(s.Plugin.Config.ObjectTypes, types.ObjectTypePage) {
 		for _, db := range databases {
-			pages, err := s.getPagesFromDatabase(ctx, db.ID)
-			if err != nil {
-				s.result.Errored(types.ObjectTypeDatabase, db.ID.String(), err)
-				if !s.Plugin.Config.ContinueOnError {
-					return s.result, fmt.Errorf("failed to get pages from database %s: %w", db.ID, err)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				pages, err := s.getPagesFromDatabase(ctx, db.ID)
+				if err != nil {
+					s.result.Errored(types.ObjectTypeDatabase, db.ID.String(), err)
+					return
 				}
-				continue
-			}
 
-			pageResult, err := s.exportPages(ctx, pages)
-			if err != nil && !s.Plugin.Config.ContinueOnError {
-				return s.result, fmt.Errorf("failed to export pages from database %s: %w", db.ID, err)
-			}
-			s.result.Successful(types.ObjectTypePage, pageResult)
+				pageResult, err := s.exportPages(ctx, pages)
+				if err != nil && !s.Plugin.Config.ContinueOnError {
+					s.result.Errored(types.ObjectTypeDatabase, db.ID.String(), err)
+					return
+				}
+				s.result.Successful(types.ObjectTypePage, pageResult)
 
-			// Export blocks from pages if enabled.
-			if s.Plugin.Config.IncludeBlocks && contains(s.Plugin.Config.ObjectTypes, types.ObjectTypeBlock) {
-				for _, page := range pages {
-					blockResult, err := s.exportPageBlocks(ctx, page.ID)
-					if err != nil {
-						s.result.Errored(types.ObjectTypeBlock, page.ID.String(), err)
-						if !s.Plugin.Config.ContinueOnError {
-							return s.result, fmt.Errorf("failed to export blocks from page %s: %w", page.ID, err)
+				// Export blocks from pages if enabled.
+				if s.Plugin.Config.IncludeBlocks && contains(s.Plugin.Config.ObjectTypes, types.ObjectTypeBlock) {
+					for _, page := range pages {
+						blockResult, err := s.exportPageBlocks(ctx, page.ID)
+						if err != nil {
+							s.result.Errored(types.ObjectTypeBlock, page.ID.String(), err)
+							return
 						}
-						continue
+						s.result.Successful(types.ObjectTypeBlock, blockResult)
 					}
-					s.result.Successful(types.ObjectTypeBlock, blockResult)
 				}
-			}
+			}()
+		}
+		wg.Wait()
+	}
+
+	// Wait for all Redis workers to finish processing queued items
+	if s.Plugin.RedisClient != nil {
+		err := s.Plugin.RedisClient.Close()
+		if err != nil {
+			multilog.Error("service", "failed to close redis client", map[string]interface{}{
+				"error": err,
+			})
 		}
 	}
 
 	s.result.End = time.Now()
+
+	fmt.Printf("exported %d pages\n", s.result.Success[types.ObjectTypePage])
 
 	return s.result, nil
 }
@@ -177,6 +194,23 @@ func (s *Service) ExportPage(ctx context.Context, pageID types.PageID, includeBl
 	return s.result, nil
 }
 
+func (s *Service) startWorkers(ctx context.Context) {
+	for i := 0; i < s.Plugin.Config.Workers; i++ {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			for obj := range s.objCh {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					s.objCh <- obj
+				}
+			}
+		}()
+	}
+}
+
 // schedule exports a slice of objects concurrently by sending them to workers goroutines.
 //
 // Arguments:
@@ -189,6 +223,11 @@ func (s *Service) ExportPage(ctx context.Context, pageID types.PageID, includeBl
 // - An error if the export operation fails.
 func (s *Service) schedule(ctx context.Context, objects []interface{}, objectType types.ObjectType) (*ExportResult, error) {
 	result := NewExportResult()
+
+	multilog.Info("schedule", "scheduling objects", map[string]interface{}{
+		"objectType": objectType,
+		"objects":    len(objects),
+	})
 
 	objCh := make(chan interface{}, len(objects))
 	resCh := make(chan workResult, len(objects))
@@ -215,17 +254,24 @@ func (s *Service) schedule(ctx context.Context, objects []interface{}, objectTyp
 					continue
 				}
 
-				key := s.Plugin.RedisClient.Key(objectType, obj)
-				if err := s.Plugin.RedisClient.Store(ctx, key, data); err != nil {
+				err = s.Plugin.RedisClient.Request(StoreRequest{
+					ObjectType: objectType,
+					Object:     data,
+					TTL:        s.Plugin.Config.TTL,
+				})
+				if err != nil {
 					resCh <- workResult{
-						Key:    key,
 						Object: obj,
 						Error:  err,
 					}
 					continue
 				}
-
-				resCh <- workResult{Key: key, Object: obj}
+				
+				// Send success result
+				resCh <- workResult{
+					Object: obj,
+					Error:  nil,
+				}
 			}
 		}()
 	}

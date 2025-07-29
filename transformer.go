@@ -4,7 +4,6 @@ package redis
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -41,7 +40,7 @@ func NewTransformer(plugin *RedisPlugin) *Transformer {
 // Returns:
 // - The transformed object as a JSON string byte slice.
 // - An error if the export operation fails.
-func (t *Transformer) Transform(ctx context.Context, objectType types.ObjectType, object interface{}) ([]byte, error) {
+func (t *Transformer) Transform(ctx context.Context, objectType types.ObjectType, object interface{}) (interface{}, error) {
 	if t.plugin.Config.ClientConfig.IncludeMeta {
 		objWithMeta, err := common.MergeObjects(object, map[string]any{
 			"metadata": map[string]any{
@@ -55,12 +54,7 @@ func (t *Transformer) Transform(ctx context.Context, objectType types.ObjectType
 		object = objWithMeta
 	}
 
-	str, err := json.Marshal(object)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal object: %w", err)
-	}
-
-	return str, nil
+	return object, nil
 }
 
 // Cleanup closes the Redis connection.

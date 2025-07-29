@@ -4,40 +4,31 @@ package redis
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/mateothegreat/go-multilog/multilog"
 	"github.com/notioncodes/types"
 	red "github.com/redis/go-redis/v9"
 )
 
-// NewRedisClient creates a new Redis client instance.
-//
-// Arguments:
-// - config: The Redis client configuration.
-//
-// Returns:
-// - The Redis client instance.
-// - An error if the Redis client creation fails.
-func NewRedisClient(config *ClientConfig) (*Client, error) {
-	client := red.NewClient(&red.Options{
-		Addr:     config.Address,
-		Username: config.Username,
-		Password: config.Password,
-		DB:       config.Database,
-	})
-
-	return &Client{
-		client: client,
-		config: config,
-	}, nil
-}
-
 // Client is a wrapper around the rueidis client.
 type Client struct {
 	client *red.Client
-	config *ClientConfig
+	plugin *RedisPlugin
+	wg     sync.WaitGroup
+	ch     chan StoreRequest
+	ctx    context.Context
+}
+
+// StoreRequest is a request to store data in Redis.
+type StoreRequest struct {
+	ObjectType types.ObjectType
+	Object     interface{}
+	TTL        time.Duration
 }
 
 // Ping pings the Redis server.
@@ -83,10 +74,10 @@ type ClientConfig struct {
 // - The Redis Key string.
 func (c *Client) Key(objectType types.ObjectType, object interface{}) string {
 	return strings.Join([]string{
-		c.config.KeyPrefix,
+		c.plugin.Config.KeyPrefix,
 		string(objectType),
 		types.ExtractID(object),
-	}, c.config.KeySeparator)
+	}, c.plugin.Config.KeySeparator)
 }
 
 // Store stores data in Redis with exponential backoff retry logic.
@@ -98,27 +89,117 @@ func (c *Client) Key(objectType types.ObjectType, object interface{}) string {
 //
 // Returns:
 // - An error if the data could not be stored.
-func (c *Client) Store(ctx context.Context, key string, data []byte) error {
+func (c *Client) Store(ctx context.Context, req StoreRequest) (string, error) {
 	var lastErr error
 
-	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
+	for attempt := 0; attempt <= c.plugin.Config.MaxRetries; attempt++ {
 		if attempt > 0 {
 			// Calculate exponential backoff and then wait for that duration.
-			backoff := time.Duration(attempt) * c.config.RetryBackoff
+			backoff := time.Duration(attempt) * c.plugin.Config.RetryBackoff
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return "", ctx.Err()
 			case <-time.After(backoff):
 			}
 		}
 
-		if err := c.client.Set(ctx, key, string(data), c.config.TTL).Err(); err != nil {
+		str, err := json.Marshal(req.Object)
+		if err != nil {
+			return "", fmt.Errorf("failed to marshal object: %w", err)
+		}
+
+		key := c.Key(req.ObjectType, req.Object)
+
+		if err := c.client.Set(ctx, key, str, req.TTL).Err(); err != nil {
 			lastErr = err
 			continue
 		}
 
-		return nil
+		return key, nil
 	}
 
-	return fmt.Errorf("failed after %d attempts: %w", c.config.MaxRetries+1, lastErr)
+	return "", fmt.Errorf("failed after %d attempts: %w", c.plugin.Config.MaxRetries+1, lastErr)
+}
+
+func (c *Client) Request(req StoreRequest) error {
+	select {
+	case c.ch <- req:
+		return nil
+	case <-c.ctx.Done():
+		return c.ctx.Err()
+	}
+}
+
+// worker is a process that listens on a channel for StoreRequests and stores
+// data in Redis.
+//
+// Returns:
+// - An error if the data could not be stored.
+func (c *Client) worker(id int) error {
+	defer c.wg.Done()
+
+	multilog.Info("redis.client.worker", "worker started", map[string]interface{}{
+		"id": id,
+	})
+
+	for req := range c.ch {
+		key, err := c.Store(c.ctx, req)
+		if err != nil {
+			multilog.Error("redis.client.worker", "failed to store data", map[string]interface{}{
+				"id":    id,
+				"key":   key,
+				"type":  req.ObjectType,
+				"error": err,
+			})
+			continue
+		}
+	}
+	return nil
+}
+
+// NewRedisClient creates a new Redis client instance.
+//
+// Arguments:
+// - config: The Redis client configuration.
+//
+// Returns:
+// - The Redis client instance.
+// - An error if the Redis client creation fails.
+func NewRedisClient(ctx context.Context, plugin *RedisPlugin) (*Client, error) {
+	client := red.NewClient(&red.Options{
+		Addr:     plugin.Config.ClientConfig.Address,
+		Username: plugin.Config.ClientConfig.Username,
+		Password: plugin.Config.ClientConfig.Password,
+		DB:       plugin.Config.ClientConfig.Database,
+	})
+
+	c := &Client{
+		client: client,
+		plugin: plugin,
+		ctx:    ctx,
+	}
+
+	c.ch = make(chan StoreRequest, c.plugin.Config.BatchSize)
+	fmt.Printf("created channel with size %d\n", c.plugin.Config.BatchSize)
+
+	for i := 0; i < c.plugin.Config.Workers; i++ {
+		c.wg.Add(1)
+		go c.worker(i)
+	}
+	return c, nil
+}
+
+// Close gracefully shuts down the Redis client and waits for all workers to finish.
+func (c *Client) Close() error {
+	close(c.ch)
+	c.wg.Wait()
+	return c.client.Close()
+}
+
+// Flush flushes the Redis database.
+//
+// Returns:
+// - An error if the Redis database could not be flushed.
+func (c *Client) Flush() error {
+	return c.client.FlushAll(context.Background()).Err()
 }

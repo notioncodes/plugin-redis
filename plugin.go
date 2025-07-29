@@ -3,6 +3,7 @@
 package redis
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -18,6 +19,7 @@ type RedisPlugin struct {
 	RedisClient  *Client
 	Service      *Service
 	Config       Config
+	Flush        bool
 }
 
 // Config is the configuration container for this plugin.
@@ -46,6 +48,9 @@ type Config struct {
 	// Error handling
 	ContinueOnError bool `json:"continue_on_error" yaml:"continue_on_error"`
 	MaxErrors       int  `json:"max_errors" yaml:"max_errors"`
+
+	// Flush
+	Flush bool `json:"flush" yaml:"flush"`
 }
 
 // NewPlugin creates a new Redis plugin.
@@ -70,16 +75,18 @@ func NewPlugin(notionClient *client.Client, config Config) (*RedisPlugin, error)
 	// }
 
 	// Create a new Redis client
-	redisClient, err := NewRedisClient(&config.ClientConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Redis client: %w", err)
-	}
 
 	plugin := &RedisPlugin{
 		Base:         *plugin.NewPlugin(config.BaseConfig),
 		NotionClient: notionClient,
-		RedisClient:  redisClient,
 		Config:       config,
+		Flush:        config.Flush,
+	}
+
+	var err error
+	plugin.RedisClient, err = NewRedisClient(context.Background(), plugin)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Redis client: %w", err)
 	}
 
 	if err := plugin.RedisClient.Ping(); err != nil {
