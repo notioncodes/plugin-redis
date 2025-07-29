@@ -18,7 +18,8 @@ import (
 // concurrent processing and batch operations for efficient Notion data export.
 type Service struct {
 	Plugin      *RedisPlugin
-	transformer *RedisTransformer
+	transformer *Transformer
+	result      *ExportResult
 }
 
 // NewService creates a new Redis service instance.
@@ -30,251 +31,251 @@ type Service struct {
 // - The Redis service instance.
 // - An error if the Redis service creation fails.
 func NewService(plugin *RedisPlugin) (*Service, error) {
-	transformer := NewRedisTransformer()
-
 	return &Service{
 		Plugin:      plugin,
-		transformer: transformer,
+		transformer: NewTransformer(plugin),
+		result:      NewExportResult(),
 	}, nil
 }
 
 // ExportAll exports all accessible Notion content to Redis.
+//
+// Arguments:
+// - ctx: The context for the export operation.
+//
+// Returns:
+// - The export result.
+// - An error if the export operation fails.
 func (s *Service) ExportAll(ctx context.Context) (*ExportResult, error) {
-	result := NewExportResult()
-
-	// Get all databases first.
+	// Export databases.
 	databases, err := s.getAllDatabases(ctx)
 	if err != nil {
-		return result, fmt.Errorf("failed to get databases: %w", err)
+		return s.result, fmt.Errorf("failed to get databases: %w", err)
 	}
 
-	// Export databases.
-	if contains(s.Plugin.Config.ObjectTypes, types.ObjectTypeDatabase) {
-		dbResult, err := s.exportDatabases(ctx, databases)
-		if err != nil && !s.Plugin.Config.ContinueOnError {
-			return result, fmt.Errorf("failed to export databases: %w", err)
-		}
-		s.mergeResults(result, dbResult)
-	}
+	// // Export databases.
+	// if contains(s.Plugin.Config.ObjectTypes, types.ObjectTypeDatabase) {
+	// 	dbResult, err := s.exportDatabases(ctx, databases)
+	// 	if err != nil && !s.Plugin.Config.ContinueOnError {
+	// 		return s.result, fmt.Errorf("failed to export databases: %w", err)
+	// 	}
+	// 	s.mergeResults(s.result, dbResult)
+	// }
 
-	// Export pages from each database.
+	// Export pages from each database if enabled.
 	if contains(s.Plugin.Config.ObjectTypes, types.ObjectTypePage) {
 		for _, db := range databases {
 			pages, err := s.getPagesFromDatabase(ctx, db.ID)
 			if err != nil {
+				s.result.Errored(types.ObjectTypeDatabase, db.ID.String(), err)
 				if !s.Plugin.Config.ContinueOnError {
-					return result, fmt.Errorf("failed to get pages from database %s: %w", db.ID, err)
+					return s.result, fmt.Errorf("failed to get pages from database %s: %w", db.ID, err)
 				}
-				result.Errors = append(result.Errors, ExportError{
-					ObjectType: types.ObjectTypeDatabase,
-					ObjectID:   db.ID.String(),
-					Error:      err.Error(),
-					Timestamp:  time.Now(),
-				})
 				continue
 			}
 
 			pageResult, err := s.exportPages(ctx, pages)
 			if err != nil && !s.Plugin.Config.ContinueOnError {
-				return result, fmt.Errorf("failed to export pages from database %s: %w", db.ID, err)
+				return s.result, fmt.Errorf("failed to export pages from database %s: %w", db.ID, err)
 			}
-			s.mergeResults(result, pageResult)
+			s.result.Successful(types.ObjectTypePage, pageResult)
 
-			// Export blocks from pages if configured.
+			// Export blocks from pages if enabled.
 			if s.Plugin.Config.IncludeBlocks && contains(s.Plugin.Config.ObjectTypes, types.ObjectTypeBlock) {
 				for _, page := range pages {
 					blockResult, err := s.exportPageBlocks(ctx, page.ID)
-					if err != nil && !s.Plugin.Config.ContinueOnError {
-						return result, fmt.Errorf("failed to export blocks from page %s: %w", page.ID, err)
+					if err != nil {
+						s.result.Errored(types.ObjectTypeBlock, page.ID.String(), err)
+						if !s.Plugin.Config.ContinueOnError {
+							return s.result, fmt.Errorf("failed to export blocks from page %s: %w", page.ID, err)
+						}
+						continue
 					}
-					s.mergeResults(result, blockResult)
+					s.result.Successful(types.ObjectTypeBlock, blockResult)
 				}
 			}
 		}
 	}
 
-	result.End = time.Now()
+	s.result.End = time.Now()
 
-	return result, nil
+	return s.result, nil
 }
 
-// ExportDatabase exports a specific database and optionally its pages to Redis.
+// ExportDatabase exports a single database.
+//
+// Arguments:
+// - ctx: The context for the export operation.
+// - databaseID: The ID of the database to export.
+// - includePages: Whether to include pages in the export.
+//
+// Returns:
+// - The export result.
+// - An error if the export operation fails.
 func (s *Service) ExportDatabase(ctx context.Context, databaseID types.DatabaseID, includePages bool) (*ExportResult, error) {
-	result := NewExportResult()
+	defer func() {
+		s.result.End = time.Now()
+	}()
 
-	// Get database.
 	db, err := s.getDatabase(ctx, databaseID)
 	if err != nil {
-		return result, fmt.Errorf("failed to get database: %w", err)
+		return s.result, fmt.Errorf("failed to get database: %w", err)
 	}
 
-	// Export database.
-	dbResult, err := s.exportObjects(ctx, []interface{}{db}, types.ObjectTypeDatabase)
+	// Export the database.
+	res, err := s.schedule(ctx, []interface{}{db}, types.ObjectTypeDatabase)
 	if err != nil {
-		return result, fmt.Errorf("failed to export database: %w", err)
+		return s.result, fmt.Errorf("failed to export database: %w", err)
 	}
-	s.mergeResults(result, dbResult)
+	s.result.Successful(types.ObjectTypeDatabase, res)
 
 	// Export pages if requested.
 	if includePages {
 		pages, err := s.getPagesFromDatabase(ctx, databaseID)
 		if err != nil {
-			return result, fmt.Errorf("failed to get pages: %w", err)
+			return s.result, fmt.Errorf("failed to get pages: %w", err)
 		}
 
-		pageResult, err := s.exportPages(ctx, pages)
+		res, err := s.exportPages(ctx, pages)
 		if err != nil {
-			return result, fmt.Errorf("failed to export pages: %w", err)
+			return s.result, fmt.Errorf("failed to export pages: %w", err)
 		}
-		s.mergeResults(result, pageResult)
+		s.result.Successful(types.ObjectTypePage, res)
 	}
 
-	result.End = time.Now()
-
-	return result, nil
+	return s.result, nil
 }
 
 // ExportPage exports a specific page and optionally its blocks to Redis.
 func (s *Service) ExportPage(ctx context.Context, pageID types.PageID, includeBlocks bool) (*ExportResult, error) {
-	result := NewExportResult()
+	defer func() {
+		s.result.End = time.Now()
+	}()
 
 	// Get page.
 	page, err := s.getPage(ctx, pageID)
 	if err != nil {
-		return result, fmt.Errorf("failed to get page: %w", err)
+		return s.result, fmt.Errorf("failed to get page: %w", err)
 	}
 
 	// Export page.
-	pageResult, err := s.exportObjects(ctx, []interface{}{page}, types.ObjectTypePage)
+	res, err := s.schedule(ctx, []interface{}{page}, types.ObjectTypePage)
 	if err != nil {
-		return result, fmt.Errorf("failed to export page: %w", err)
+		return s.result, fmt.Errorf("failed to export page: %w", err)
 	}
-	s.mergeResults(result, pageResult)
+	s.result.Successful(types.ObjectTypePage, res)
 
 	// Export blocks if requested.
 	if includeBlocks {
-		blockResult, err := s.exportPageBlocks(ctx, pageID)
+		res, err := s.exportPageBlocks(ctx, pageID)
 		if err != nil {
-			return result, fmt.Errorf("failed to export blocks: %w", err)
+			return s.result, fmt.Errorf("failed to export blocks: %w", err)
 		}
-		s.mergeResults(result, blockResult)
+		s.result.Successful(types.ObjectTypeBlock, res)
 	}
 
-	result.End = time.Now()
-
-	return result, nil
+	return s.result, nil
 }
 
-// exportObjects exports a slice of objects concurrently.
-func (s *Service) exportObjects(ctx context.Context, objects []interface{}, objectType types.ObjectType) (*ExportResult, error) {
+// schedule exports a slice of objects concurrently by sending them to workers goroutines.
+//
+// Arguments:
+// - ctx: The context for the export operation.
+// - objects: The objects to export.
+// - objectType: The type of objects to export.
+//
+// Returns:
+// - The export result.
+// - An error if the export operation fails.
+func (s *Service) schedule(ctx context.Context, objects []interface{}, objectType types.ObjectType) (*ExportResult, error) {
 	result := NewExportResult()
 
-	if len(objects) == 0 {
-		return result, nil
-	}
+	objCh := make(chan interface{}, len(objects))
+	resCh := make(chan workResult, len(objects))
+	wg := sync.WaitGroup{}
 
-	// Create worker pool.
-	objectChan := make(chan interface{}, len(objects))
-	resultChan := make(chan exportWorkerResult, len(objects))
-
-	// Start workers.
-	var wg sync.WaitGroup
+	// Start all workers.
 	for i := 0; i < s.Plugin.Config.Workers; i++ {
 		wg.Add(1)
-		go s.exportWorker(ctx, objectChan, resultChan, objectType, &wg)
+		go func() {
+			defer wg.Done()
+			for obj := range objCh {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				data, err := s.transformer.Transform(ctx, objectType, obj)
+				if err != nil {
+					resCh <- workResult{
+						Object: obj,
+						Error:  err,
+					}
+					continue
+				}
+
+				key := s.Plugin.RedisClient.Key(objectType, obj)
+				if err := s.Plugin.RedisClient.Store(ctx, key, data); err != nil {
+					resCh <- workResult{
+						Key:    key,
+						Object: obj,
+						Error:  err,
+					}
+					continue
+				}
+
+				resCh <- workResult{Key: key, Object: obj}
+			}
+		}()
 	}
 
-	// Send objects to workers.
+	// Enqueue objects and let the channel handle distribution.
 	for _, obj := range objects {
 		select {
-		case objectChan <- obj:
+		case objCh <- obj:
 		case <-ctx.Done():
-			close(objectChan)
+			close(objCh)
+			wg.Wait()
+			close(resCh)
 			return result, ctx.Err()
 		}
 	}
-	close(objectChan)
+	close(objCh)
 
-	// Wait for workers to complete.
+	// Close result channel after workers complete.
 	go func() {
 		wg.Wait()
-		close(resultChan)
+		close(resCh)
 	}()
 
-	for workerResult := range resultChan {
-		if workerResult.Error != nil {
+	for res := range resCh {
+		if res.Error != nil {
 			result.Errors = append(result.Errors, ExportError{
 				ObjectType: objectType,
-				ObjectID:   workerResult.ObjectID,
-				Error:      workerResult.Error.Error(),
+				Error:      res.Error.Error(),
 				Timestamp:  time.Now(),
 			})
-
-			if len(result.Errors) >= s.Plugin.Config.MaxErrors {
-				return result, fmt.Errorf("max errors (%d) reached", s.Plugin.Config.MaxErrors)
-			}
 		} else {
-			result.Success++
+			result.Success[objectType]++
 		}
 
-		s.Plugin.Base.Reporter.Report(len(objects), result.Success+len(result.Errors), objectType, workerResult.Object)
+		s.Plugin.Base.Reporter.Report(map[string]interface{}{
+			"objectType": objectType,
+			"successful": result.Success,
+			"errors":     len(result.Errors),
+			"total":      len(objects),
+		})
 	}
 
 	return result, nil
 }
 
-// exportWorker processes objects from the channel and exports them to Redis.
-func (s *Service) exportWorker(ctx context.Context, objectChan <-chan interface{}, resultChan chan<- exportWorkerResult, objectType types.ObjectType, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	for object := range objectChan {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		// Extract object ID for error reporting.
-		var objectID string
-		switch objectType {
-		case types.ObjectTypePage:
-			if page, ok := object.(*types.Page); ok {
-				objectID = page.ID.String()
-			}
-		case types.ObjectTypeDatabase:
-			if db, ok := object.(*types.Database); ok {
-				objectID = db.ID.String()
-			}
-		case types.ObjectTypeBlock:
-			if block, ok := object.(*types.Block); ok {
-				objectID = block.ID.String()
-			}
-		}
-
-		// Transform object.
-		_, err := s.transformer.Transform(ctx, objectType, object)
-
-		resultChan <- exportWorkerResult{
-			ObjectID: objectID,
-			Object:   object,
-			Error:    err,
-		}
-	}
-}
-
-// Helper methods for data retrieval.
-
 func (s *Service) getAllDatabases(ctx context.Context) ([]*types.Database, error) {
-	startTime := time.Now()
-	defer func() {
-		fmt.Printf("[DEBUG] getAllDatabases took %v\n", time.Since(startTime))
-	}()
-
-	// Create a timeout context for the search operation.
 	searchCtx, cancel := context.WithTimeout(ctx, s.Plugin.Config.Timeout)
 	defer cancel()
 
-	ch := s.Plugin.NotionClient.Search().Query(searchCtx, types.SearchRequest{
+	ch := s.Plugin.NotionClient.Registry.Search().Stream(searchCtx, types.SearchRequest{
 		Query: "",
 		Filter: &types.SearchFilter{
 			Property: "object",
@@ -299,7 +300,7 @@ func (s *Service) getAllDatabases(ctx context.Context) ([]*types.Database, error
 }
 
 func (s *Service) getDatabase(ctx context.Context, databaseID types.DatabaseID) (*types.Database, error) {
-	result, err := client.ToGoResult(s.Plugin.NotionClient.Databases().Get(ctx, databaseID))
+	result, err := client.ToGoResult(s.Plugin.NotionClient.Registry.Databases().Get(ctx, databaseID))
 	if err != nil {
 		return nil, err
 	}
@@ -307,16 +308,10 @@ func (s *Service) getDatabase(ctx context.Context, databaseID types.DatabaseID) 
 }
 
 func (s *Service) getPagesFromDatabase(ctx context.Context, databaseID types.DatabaseID) ([]*types.Page, error) {
-	startTime := time.Now()
-	defer func() {
-		fmt.Printf("[DEBUG] getPagesFromDatabase(%s) took %v\n", databaseID, time.Since(startTime))
-	}()
-
-	// Create a timeout context for the database query.
 	queryCtx, cancel := context.WithTimeout(ctx, s.Plugin.Config.Timeout)
 	defer cancel()
 
-	ch := s.Plugin.NotionClient.Databases().Query(queryCtx, databaseID, nil, nil)
+	ch := s.Plugin.NotionClient.Registry.Databases().Query(queryCtx, databaseID, nil, nil)
 
 	var pages []*types.Page
 	for result := range ch {
@@ -333,11 +328,11 @@ func (s *Service) getPagesFromDatabase(ctx context.Context, databaseID types.Dat
 }
 
 func (s *Service) getPage(ctx context.Context, pageID types.PageID) (*types.Page, error) {
-	result, err := client.ToGoResult(s.Plugin.NotionClient.Pages().Get(ctx, pageID))
-	if err != nil {
-		return nil, err
+	result := s.Plugin.NotionClient.Registry.Pages().Get(ctx, pageID)
+	if result.IsError() {
+		return nil, result.Error
 	}
-	return &result, nil
+	return &result.Data, nil
 }
 
 func (s *Service) exportDatabases(ctx context.Context, databases []*types.Database) (*ExportResult, error) {
@@ -345,7 +340,7 @@ func (s *Service) exportDatabases(ctx context.Context, databases []*types.Databa
 	for i, db := range databases {
 		objects[i] = db
 	}
-	return s.exportObjects(ctx, objects, types.ObjectTypeDatabase)
+	return s.schedule(ctx, objects, types.ObjectTypeDatabase)
 }
 
 func (s *Service) exportPages(ctx context.Context, pages []*types.Page) (*ExportResult, error) {
@@ -353,30 +348,33 @@ func (s *Service) exportPages(ctx context.Context, pages []*types.Page) (*Export
 	for i, page := range pages {
 		objects[i] = page
 	}
-	return s.exportObjects(ctx, objects, types.ObjectTypePage)
+	return s.schedule(ctx, objects, types.ObjectTypePage)
 }
 
 // exportPageBlocks exports all blocks from a specific page.
-// Note: This is a placeholder implementation. The current client API doesn't provide
-// a direct method to get blocks for a page. This would need to be implemented
-// based on the specific client API structure.
-func (s *Service) exportPageBlocks(_ context.Context, pageID types.PageID) (*ExportResult, error) {
-	// TODO: Implement block retrieval when client API supports it.
-	// For now, return an empty result to avoid breaking the export flow.
-	result := NewExportResult()
-	result.Errors = append(result.Errors, ExportError{
-		ObjectType: types.ObjectTypeBlock,
-		ObjectID:   pageID.String(),
-		Error:      "Block export not yet implemented - client API limitation",
-		Timestamp:  time.Now(),
-	})
-	return result, nil
-}
+func (s *Service) exportPageBlocks(ctx context.Context, pageID types.PageID) (*ExportResult, error) {
+	// Convert PageID to BlockID since pages can be treated as blocks for getting their children
+	blockID := types.BlockID(pageID)
 
-// mergeResults combines two export results.
-func (s *Service) mergeResults(target, source *ExportResult) {
-	target.Success += source.Success
-	target.Errors = append(target.Errors, source.Errors...)
+	// Get page blocks using the new GetChildren API
+	ch := s.Plugin.NotionClient.Registry.Blocks().GetChildren(ctx, blockID)
+
+	var blocks []*types.Block
+	for result := range ch {
+		if result.Error != nil {
+			// Return error if we can't get blocks
+			return NewExportResult(), result.Error
+		}
+		blocks = append(blocks, &result.Data)
+	}
+
+	// Export the blocks
+	objects := make([]interface{}, len(blocks))
+	for i, block := range blocks {
+		objects[i] = block
+	}
+
+	return s.schedule(ctx, objects, types.ObjectTypeBlock)
 }
 
 // CreateIndex creates an index for the given index name and index type.
@@ -409,26 +407,46 @@ type ExportError struct {
 	Timestamp  time.Time        `json:"timestamp"`
 }
 
-// exportWorkerResult represents the result of a worker operation.
-type exportWorkerResult struct {
-	ObjectID string
-	Object   interface{}
-	Error    error
-}
-
-// ExportResult contains the results of an export operation.
-type ExportResult struct {
-	Start   time.Time     `json:"start"`
-	End     time.Time     `json:"end"`
-	Success int           `json:"success"`
-	Errors  []ExportError `json:"errors,omitempty"`
+// workResult represents the result of a worker operation.
+type workResult struct {
+	Key    string
+	Object interface{}
+	Error  error
 }
 
 // NewExportResult creates a new ExportResult.
 func NewExportResult() *ExportResult {
 	return &ExportResult{
 		Start:   time.Now(),
-		Success: 0,
+		Success: make(map[types.ObjectType]int),
 		Errors:  []ExportError{},
 	}
+}
+
+// ExportResult contains the results of an export operation.
+type ExportResult struct {
+	Start   time.Time                `json:"start"`
+	End     time.Time                `json:"end"`
+	Success map[types.ObjectType]int `json:"success"`
+	Errors  []ExportError            `json:"errors,omitempty"`
+	mu      sync.RWMutex
+}
+
+func (e *ExportResult) Errored(objectType types.ObjectType, objectID string, err error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.Errors = append(e.Errors, ExportError{
+		ObjectType: objectType,
+		ObjectID:   objectID,
+		Error:      err.Error(),
+		Timestamp:  time.Now(),
+	})
+}
+
+func (e *ExportResult) Successful(objectType types.ObjectType, r *ExportResult) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.Success[objectType] += r.Success[objectType]
+	e.Errors = append(e.Errors, r.Errors...)
 }

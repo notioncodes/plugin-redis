@@ -82,6 +82,10 @@ func NewPlugin(notionClient *client.Client, config Config) (*RedisPlugin, error)
 		Config:       config,
 	}
 
+	if err := plugin.RedisClient.Ping(); err != nil {
+		return nil, fmt.Errorf("failed to ping Redis: %w", err)
+	}
+
 	// Create a new Redis service
 	plugin.Service, err = NewService(plugin)
 	if err != nil {

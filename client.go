@@ -4,10 +4,35 @@ package redis
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 
+	"github.com/notioncodes/types"
 	red "github.com/redis/go-redis/v9"
 )
+
+// NewRedisClient creates a new Redis client instance.
+//
+// Arguments:
+// - config: The Redis client configuration.
+//
+// Returns:
+// - The Redis client instance.
+// - An error if the Redis client creation fails.
+func NewRedisClient(config *ClientConfig) (*Client, error) {
+	client := red.NewClient(&red.Options{
+		Addr:     config.Address,
+		Username: config.Username,
+		Password: config.Password,
+		DB:       config.Database,
+	})
+
+	return &Client{
+		client: client,
+		config: config,
+	}, nil
+}
 
 // Client is a wrapper around the rueidis client.
 type Client struct {
@@ -23,7 +48,7 @@ func (c *Client) Ping() error {
 	return c.client.Ping(context.Background()).Err()
 }
 
-// ClientConfig holds configuration for the Redis transformer.
+// ClientConfig holds configuration for the Redis client.
 type ClientConfig struct {
 	// Redis connection settings
 	Address  string `json:"address" yaml:"address"`
@@ -47,41 +72,53 @@ type ClientConfig struct {
 	RetryBackoff time.Duration `json:"retry_backoff" yaml:"retry_backoff"`
 }
 
-// defaultRedisConfig returns sensible defaults for Redis configuration.
-func defaultRedisConfig() *ClientConfig {
-	return &ClientConfig{
-		Address:      "localhost:6379",
-		Database:     0,
-		KeyPrefix:    "notion",
-		KeySeparator: ":",
-		TTL:          24 * time.Hour,
-		PrettyJSON:   false,
-		IncludeMeta:  true,
-		Pipeline:     true,
-		BatchSize:    100,
-		MaxRetries:   3,
-		RetryBackoff: time.Second,
-	}
-}
-
-// NewRedisClient creates a new Redis client instance.
+// Key generates a string intended to be used as a Key for redis storage.
+// The Key is formatted as `<key_prefix>:<object_type>:<object_id>`.
 //
 // Arguments:
-// - config: The Redis client configuration.
+// - objectType: The type of object.
+// - object: The object to generate a Key for.
 //
 // Returns:
-// - The Redis client instance.
-// - An error if the Redis client creation fails.
-func NewRedisClient(config *ClientConfig) (*Client, error) {
-	client := red.NewClient(&red.Options{
-		Addr:     config.Address,
-		Username: config.Username,
-		Password: config.Password,
-		DB:       config.Database,
-	})
+// - The Redis Key string.
+func (c *Client) Key(objectType types.ObjectType, object interface{}) string {
+	return strings.Join([]string{
+		c.config.KeyPrefix,
+		string(objectType),
+		types.ExtractID(object),
+	}, c.config.KeySeparator)
+}
 
-	return &Client{
-		client: client,
-		config: config,
-	}, nil
+// Store stores data in Redis with exponential backoff retry logic.
+//
+// Arguments:
+// - ctx: The context for the operation.
+// - key: The key to Store the data at.
+// - data: The data to Store.
+//
+// Returns:
+// - An error if the data could not be stored.
+func (c *Client) Store(ctx context.Context, key string, data []byte) error {
+	var lastErr error
+
+	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
+		if attempt > 0 {
+			// Calculate exponential backoff and then wait for that duration.
+			backoff := time.Duration(attempt) * c.config.RetryBackoff
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+
+		if err := c.client.Set(ctx, key, string(data), c.config.TTL).Err(); err != nil {
+			lastErr = err
+			continue
+		}
+
+		return nil
+	}
+
+	return fmt.Errorf("failed after %d attempts: %w", c.config.MaxRetries+1, lastErr)
 }
