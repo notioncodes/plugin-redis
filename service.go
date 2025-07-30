@@ -106,10 +106,6 @@ func (s *Service) Export(ctx context.Context) (*ExportResult, error) {
 
 				// Export blocks from pages if enabled.
 				if s.Plugin.Config.Content.Pages.Blocks && slices.Contains(s.Plugin.Config.Content.Types, types.ObjectTypeBlock) {
-					multilog.Info("export", "exporting blocks", map[string]interface{}{
-						"databaseID": db.ID,
-						"pageCount":  len(pages),
-					})
 					for _, page := range pages {
 						blockResult, err := s.exportPageBlocks(ctx, page.ID)
 						if err != nil {
@@ -328,12 +324,6 @@ func (s *Service) getPagesFromDatabase(ctx context.Context, databaseID types.Dat
 			}
 			return pages, result.Error
 		}
-
-		multilog.Info("getPagesFromDatabase", "got page from database", map[string]interface{}{
-			"pageID": result.Data.ID.String(),
-			"object": result.Data.Object,
-		})
-
 		pages = append(pages, &result.Data)
 	}
 
