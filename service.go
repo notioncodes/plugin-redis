@@ -51,19 +51,23 @@ func NewService(plugin *Plugin) (*Service, error) {
 // - The export result.
 // - An error if the export operation fails.
 func (s *Service) Export(ctx context.Context) (*ExportResult, error) {
-	databases, err := s.getAllDatabases(ctx)
-	if err != nil {
-		return s.result, fmt.Errorf("failed to get databases: %w", err)
-	}
+	var databases []*types.Database
+	var err error
 
-	// // Export databases.
-	// if contains(s.Plugin.Config.ObjectTypes, types.ObjectTypeDatabase) {
-	// 	dbResult, err := s.exportDatabases(ctx, databases)
-	// 	if err != nil && !s.Plugin.Config.ContinueOnError {
-	// 		return s.result, fmt.Errorf("failed to export databases: %w", err)
-	// 	}
-	// 	s.mergeResults(s.result, dbResult)
-	// }
+	if s.Plugin.Config.Content.Databases.IDs != nil {
+		for _, dbID := range s.Plugin.Config.Content.Databases.IDs {
+			db, err := s.getDatabase(ctx, dbID)
+			if err != nil {
+				return s.result, fmt.Errorf("failed to get database: %w", err)
+			}
+			databases = append(databases, db)
+		}
+	} else {
+		databases, err = s.getAllDatabases(ctx)
+		if err != nil {
+			return s.result, fmt.Errorf("failed to get databases: %w", err)
+		}
+	}
 
 	wg := sync.WaitGroup{}
 
@@ -79,29 +83,22 @@ func (s *Service) Export(ctx context.Context) (*ExportResult, error) {
 					return
 				}
 
-				for _, page := range pages {
-					data, err := s.transformer.Transform(ctx, types.ObjectTypePage, page)
-					if err != nil {
-						s.result.Errored(types.ObjectTypePage, page.ID.String(), err)
+				// Convert pages to interface slice for batch processing
+				pageObjects := make([]interface{}, len(pages))
+				for i, page := range pages {
+					pageObjects[i] = page
+				}
+
+				// Export pages using the scheduler for consistency
+				pageResult, err := s.schedule(ctx, pageObjects, types.ObjectTypePage)
+				if err != nil {
+					s.result.Errored(types.ObjectTypeDatabase, db.ID.String(), fmt.Errorf("failed to export pages: %w", err))
+					if !s.Plugin.Config.Common.ContinueOnError {
 						return
 					}
-
-					err = s.Plugin.RedisClient.Request(StoreRequest{
-						ObjectType: types.ObjectTypePage,
-						Object:     data,
-						TTL:        s.Plugin.Config.ClientConfig.TTL,
-					})
-					if err != nil {
-						s.result.Errored(types.ObjectTypePage, page.ID.String(), err)
-						if !s.Plugin.Config.Common.ContinueOnError {
-							return
-						}
-					} else {
-						// Count successful page exports
-						s.result.mu.Lock()
-						s.result.Success[types.ObjectTypePage]++
-						s.result.mu.Unlock()
-					}
+				} else {
+					// Merge page results into main result
+					s.result.Successful(types.ObjectTypePage, pageResult)
 				}
 
 				// Export blocks from pages if enabled.
@@ -110,9 +107,12 @@ func (s *Service) Export(ctx context.Context) (*ExportResult, error) {
 						blockResult, err := s.exportPageBlocks(ctx, page.ID)
 						if err != nil {
 							s.result.Errored(types.ObjectTypeBlock, page.ID.String(), err)
-							return
+							if !s.Plugin.Config.Common.ContinueOnError {
+								return
+							}
+						} else {
+							s.result.Successful(types.ObjectTypeBlock, blockResult)
 						}
-						s.result.Successful(types.ObjectTypeBlock, blockResult)
 					}
 				}
 			}()
@@ -131,8 +131,6 @@ func (s *Service) Export(ctx context.Context) (*ExportResult, error) {
 	}
 
 	s.result.End = time.Now()
-
-	fmt.Printf("exported %d pages\n", s.result.Success[types.ObjectTypePage])
 
 	return s.result, nil
 }
@@ -249,15 +247,32 @@ func (s *Service) schedule(ctx context.Context, objects []interface{}, objectTyp
 
 	for res := range resCh {
 		if res.Error != nil {
+			// Extract object ID based on type
+			var objectID string
+			switch v := res.Object.(type) {
+			case *types.Page:
+				objectID = v.ID.String()
+			case *types.Block:
+				objectID = v.ID.String()
+			case *types.Database:
+				objectID = v.ID.String()
+			default:
+				objectID = "unknown"
+			}
+
 			result.Errors = append(result.Errors, ExportError{
 				ObjectType: objectType,
+				ObjectID:   objectID,
 				Error:      res.Error.Error(),
 				Timestamp:  time.Now(),
 			})
 		} else {
 			result.Success[objectType]++
 		}
+	}
 
+	// Report metrics once after processing all results
+	if len(objects) > 0 {
 		httpMetrics := s.Plugin.NotionClient.GetMetrics()
 		s.Plugin.Base.Reporter.Report(map[string]interface{}{
 			"objectType":               objectType,
@@ -352,8 +367,22 @@ func (s *Service) getPage(ctx context.Context, pageID types.PageID) (*types.Page
 }
 
 // exportPageBlocks exports all blocks from a specific page.
+//
+// Arguments:
+// - ctx: The context for the export operation.
+// - pageID: The ID of the page to export blocks from.
+//
+// Returns:
+// - The export result.
+// - An error if the export operation fails.
 func (s *Service) exportPageBlocks(ctx context.Context, pageID types.PageID) (*ExportResult, error) {
-	ch := s.Plugin.NotionClient.Registry.Blocks().GetChildren(ctx, types.BlockID(pageID.String()))
+	var ch <-chan client.Result[types.Block]
+
+	if s.Plugin.Config.Content.Blocks.Children {
+		ch = s.Plugin.NotionClient.Registry.Blocks().GetChildrenRecursive(ctx, types.BlockID(pageID.String()))
+	} else {
+		ch = s.Plugin.NotionClient.Registry.Blocks().GetChildren(ctx, types.BlockID(pageID.String()))
+	}
 
 	var blocks []*types.Block
 	for result := range ch {
@@ -452,5 +481,6 @@ func (e *ExportResult) Total() int {
 	for _, count := range e.Success {
 		total += count
 	}
+
 	return total + len(e.Errors)
 }
