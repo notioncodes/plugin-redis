@@ -215,7 +215,6 @@ func NewRedisClient(ctx context.Context, plugin *Pugin) (*Client, error) {
 	}
 
 	c.ch = make(chan StoreRequest, c.plugin.Config.BatchSize)
-	fmt.Printf("created channel with size %d\n", c.plugin.Config.BatchSize)
 
 	for i := 0; i < c.plugin.Config.Common.Workers; i++ {
 		c.wg.Add(1)
