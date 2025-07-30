@@ -4,17 +4,14 @@ package redis
 
 import (
 	"context"
-	"fmt"
-	"time"
 
-	"github.com/notioncodes/common"
 	"github.com/notioncodes/types"
 )
 
 // Transformer is responsible for transforming the object into a format that
 // can be stored in Redis.
 type Transformer struct {
-	plugin *RedisPlugin
+	plugin *Pugin
 }
 
 // NewTransformer creates a new Transformer instance.
@@ -24,7 +21,7 @@ type Transformer struct {
 //
 // Returns:
 // - The Transformer instance.
-func NewTransformer(plugin *RedisPlugin) *Transformer {
+func NewTransformer(plugin *Pugin) *Transformer {
 	return &Transformer{
 		plugin: plugin,
 	}
@@ -41,18 +38,18 @@ func NewTransformer(plugin *RedisPlugin) *Transformer {
 // - The transformed object as a JSON string byte slice.
 // - An error if the export operation fails.
 func (t *Transformer) Transform(ctx context.Context, objectType types.ObjectType, object interface{}) (interface{}, error) {
-	if t.plugin.Config.ClientConfig.IncludeMeta {
-		objWithMeta, err := common.MergeObjects(object, map[string]any{
-			"metadata": map[string]any{
-				"object_type": string(objectType),
-				"exported_at": time.Now(),
-			},
-		})
-		if err != nil {
-			return nil, fmt.Errorf("injecting metadata failed: %w", err)
-		}
-		object = objWithMeta
-	}
+	// if t.plugin.Config.ClientConfig.IncludeMeta {
+	// 	objWithMeta, err := common.MergeObjects(common.ToInterfaceMap(object), map[string]any{
+	// 		"metadata": map[string]any{
+	// 			"object_type": string(objectType),
+	// 			"exported_at": time.Now(),
+	// 		},
+	// 	})
+	// 	if err != nil {
+	// 		return nil, fmt.Errorf("injecting metadata failed: %w", err)
+	// 	}
+	// 	object = objWithMeta
+	// }
 
 	return object, nil
 }

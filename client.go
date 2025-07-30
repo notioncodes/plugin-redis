@@ -18,7 +18,7 @@ import (
 // Client is a wrapper around the rueidis client.
 type Client struct {
 	client *red.Client
-	plugin *RedisPlugin
+	plugin *Pugin
 	wg     sync.WaitGroup
 	ch     chan StoreRequest
 	ctx    context.Context
@@ -111,9 +111,20 @@ func (c *Client) Store(ctx context.Context, req StoreRequest) (string, error) {
 		key := c.Key(req.ObjectType, req.Object)
 
 		if err := c.client.Set(ctx, key, str, req.TTL).Err(); err != nil {
+			multilog.Error("redis.client.Store", "failed to set key in redis", map[string]interface{}{
+				"key":        key,
+				"objectType": req.ObjectType,
+				"error":      err,
+				"attempt":    attempt + 1,
+			})
 			lastErr = err
 			continue
 		}
+
+		multilog.Trace("redis.client.Store", "stored object", map[string]interface{}{
+			"key":        key,
+			"objectType": req.ObjectType,
+		})
 
 		return key, nil
 	}
@@ -122,12 +133,9 @@ func (c *Client) Store(ctx context.Context, req StoreRequest) (string, error) {
 }
 
 func (c *Client) Request(req StoreRequest) error {
-	select {
-	case c.ch <- req:
-		return nil
-	case <-c.ctx.Done():
-		return c.ctx.Err()
-	}
+	// Store directly instead of queuing to workers
+	_, err := c.Store(c.ctx, req)
+	return err
 }
 
 // worker is a process that listens on a channel for StoreRequests and stores
@@ -143,6 +151,11 @@ func (c *Client) worker(id int) error {
 	})
 
 	for req := range c.ch {
+		multilog.Info("redis.client.worker", "processing request", map[string]interface{}{
+			"id":         id,
+			"objectType": req.ObjectType,
+		})
+
 		key, err := c.Store(c.ctx, req)
 		if err != nil {
 			multilog.Error("redis.client.worker", "failed to store data", map[string]interface{}{
@@ -153,6 +166,28 @@ func (c *Client) worker(id int) error {
 			})
 			continue
 		}
+
+		multilog.Info("redis.client.worker", "successfully processed request", map[string]interface{}{
+			"id":  id,
+			"key": key,
+		})
+	}
+	return nil
+}
+
+// CreateIndex creates an index for the given index name and index type.
+func (c *Client) CreateIndex(ctx context.Context) error {
+	idx := c.client.Do(ctx, c.client.FTCreate(ctx, c.plugin.Config.KeyPrefix, &red.FTCreateOptions{
+		OnJSON: true,
+		Prefix: []interface{}{c.plugin.Config.KeyPrefix},
+	}, &red.FieldSchema{
+		FieldName: "$.id",
+		FieldType: red.SearchFieldTypeText,
+		Sortable:  true,
+		As:        "id",
+	}))
+	if idx.Err() != nil {
+		return idx.Err()
 	}
 	return nil
 }
@@ -165,7 +200,7 @@ func (c *Client) worker(id int) error {
 // Returns:
 // - The Redis client instance.
 // - An error if the Redis client creation fails.
-func NewRedisClient(ctx context.Context, plugin *RedisPlugin) (*Client, error) {
+func NewRedisClient(ctx context.Context, plugin *Pugin) (*Client, error) {
 	client := red.NewClient(&red.Options{
 		Addr:     plugin.Config.ClientConfig.Address,
 		Username: plugin.Config.ClientConfig.Username,
@@ -182,7 +217,7 @@ func NewRedisClient(ctx context.Context, plugin *RedisPlugin) (*Client, error) {
 	c.ch = make(chan StoreRequest, c.plugin.Config.BatchSize)
 	fmt.Printf("created channel with size %d\n", c.plugin.Config.BatchSize)
 
-	for i := 0; i < c.plugin.Config.Workers; i++ {
+	for i := 0; i < c.plugin.Config.Common.Workers; i++ {
 		c.wg.Add(1)
 		go c.worker(i)
 	}

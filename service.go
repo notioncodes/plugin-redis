@@ -5,20 +5,21 @@ package redis
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/mateothegreat/go-multilog/multilog"
-	red "github.com/redis/go-redis/v9"
 
 	"github.com/notioncodes/client"
+	"github.com/notioncodes/common"
 	"github.com/notioncodes/types"
 )
 
 // Service provides high-level Redis export functionality with
 // concurrent processing and batch operations for efficient Notion data export.
 type Service struct {
-	Plugin      *RedisPlugin
+	Plugin      *Pugin
 	transformer *Transformer
 	result      *ExportResult
 	wg          sync.WaitGroup
@@ -34,7 +35,7 @@ type Service struct {
 // Returns:
 // - The Redis service instance.
 // - An error if the Redis service creation fails.
-func NewService(plugin *RedisPlugin) (*Service, error) {
+func NewService(plugin *Pugin) (*Service, error) {
 	return &Service{
 		Plugin:      plugin,
 		transformer: NewTransformer(plugin),
@@ -42,7 +43,7 @@ func NewService(plugin *RedisPlugin) (*Service, error) {
 	}, nil
 }
 
-// ExportAll exports all accessible Notion content to Redis.
+// Export exports all accessible Notion content to Redis.
 //
 // Arguments:
 // - ctx: The context for the export operation.
@@ -50,7 +51,7 @@ func NewService(plugin *RedisPlugin) (*Service, error) {
 // Returns:
 // - The export result.
 // - An error if the export operation fails.
-func (s *Service) ExportAll(ctx context.Context) (*ExportResult, error) {
+func (s *Service) Export(ctx context.Context) (*ExportResult, error) {
 	databases, err := s.getAllDatabases(ctx)
 	if err != nil {
 		return s.result, fmt.Errorf("failed to get databases: %w", err)
@@ -68,7 +69,7 @@ func (s *Service) ExportAll(ctx context.Context) (*ExportResult, error) {
 	wg := sync.WaitGroup{}
 
 	// Export pages from each database if enabled.
-	if contains(s.Plugin.Config.ObjectTypes, types.ObjectTypePage) {
+	if slices.Contains(s.Plugin.Config.Content.Types, types.ObjectTypePage) {
 		for _, db := range databases {
 			wg.Add(1)
 			go func() {
@@ -79,15 +80,33 @@ func (s *Service) ExportAll(ctx context.Context) (*ExportResult, error) {
 					return
 				}
 
-				pageResult, err := s.exportPages(ctx, pages)
-				if err != nil && !s.Plugin.Config.ContinueOnError {
-					s.result.Errored(types.ObjectTypeDatabase, db.ID.String(), err)
-					return
+				for _, page := range pages {
+					data, err := s.transformer.Transform(ctx, types.ObjectTypePage, page)
+					if err != nil {
+						s.result.Errored(types.ObjectTypePage, page.ID.String(), err)
+						return
+					}
+
+					err = s.Plugin.RedisClient.Request(StoreRequest{
+						ObjectType: types.ObjectTypePage,
+						Object:     data,
+						TTL:        s.Plugin.Config.ClientConfig.TTL,
+					})
+
+					// pageResult, err := s.schedule(ctx, []interface{}{data}, types.ObjectTypePage)
+					// if err != nil && !s.Plugin.Config.ContinueOnError {
+					// 	s.result.Errored(types.ObjectTypeDatabase, db.ID.String(), err)
+					// 	return
+					// }
+					// s.result.Successful(types.ObjectTypePage, pageResult)
 				}
-				s.result.Successful(types.ObjectTypePage, pageResult)
 
 				// Export blocks from pages if enabled.
-				if s.Plugin.Config.IncludeBlocks && contains(s.Plugin.Config.ObjectTypes, types.ObjectTypeBlock) {
+				if s.Plugin.Config.Content.Pages.Blocks && slices.Contains(s.Plugin.Config.Content.Types, types.ObjectTypeBlock) {
+					multilog.Info("export", "exporting blocks", map[string]interface{}{
+						"databaseID": db.ID,
+						"pageCount":  len(pages),
+					})
 					for _, page := range pages {
 						blockResult, err := s.exportPageBlocks(ctx, page.ID)
 						if err != nil {
@@ -115,50 +134,6 @@ func (s *Service) ExportAll(ctx context.Context) (*ExportResult, error) {
 	s.result.End = time.Now()
 
 	fmt.Printf("exported %d pages\n", s.result.Success[types.ObjectTypePage])
-
-	return s.result, nil
-}
-
-// ExportDatabase exports a single database.
-//
-// Arguments:
-// - ctx: The context for the export operation.
-// - databaseID: The ID of the database to export.
-// - includePages: Whether to include pages in the export.
-//
-// Returns:
-// - The export result.
-// - An error if the export operation fails.
-func (s *Service) ExportDatabase(ctx context.Context, databaseID types.DatabaseID, includePages bool) (*ExportResult, error) {
-	defer func() {
-		s.result.End = time.Now()
-	}()
-
-	db, err := s.getDatabase(ctx, databaseID)
-	if err != nil {
-		return s.result, fmt.Errorf("failed to get database: %w", err)
-	}
-
-	// Export the database.
-	res, err := s.schedule(ctx, []interface{}{db}, types.ObjectTypeDatabase)
-	if err != nil {
-		return s.result, fmt.Errorf("failed to export database: %w", err)
-	}
-	s.result.Successful(types.ObjectTypeDatabase, res)
-
-	// Export pages if requested.
-	if includePages {
-		pages, err := s.getPagesFromDatabase(ctx, databaseID)
-		if err != nil {
-			return s.result, fmt.Errorf("failed to get pages: %w", err)
-		}
-
-		res, err := s.exportPages(ctx, pages)
-		if err != nil {
-			return s.result, fmt.Errorf("failed to export pages: %w", err)
-		}
-		s.result.Successful(types.ObjectTypePage, res)
-	}
 
 	return s.result, nil
 }
@@ -194,23 +169,6 @@ func (s *Service) ExportPage(ctx context.Context, pageID types.PageID, includeBl
 	return s.result, nil
 }
 
-func (s *Service) startWorkers(ctx context.Context) {
-	for i := 0; i < s.Plugin.Config.Workers; i++ {
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			for obj := range s.objCh {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					s.objCh <- obj
-				}
-			}
-		}()
-	}
-}
-
 // schedule exports a slice of objects concurrently by sending them to workers goroutines.
 //
 // Arguments:
@@ -224,7 +182,7 @@ func (s *Service) startWorkers(ctx context.Context) {
 func (s *Service) schedule(ctx context.Context, objects []interface{}, objectType types.ObjectType) (*ExportResult, error) {
 	result := NewExportResult()
 
-	multilog.Info("schedule", "scheduling objects", map[string]interface{}{
+	multilog.Info("schedule", "queueing objects", map[string]interface{}{
 		"objectType": objectType,
 		"objects":    len(objects),
 	})
@@ -234,7 +192,7 @@ func (s *Service) schedule(ctx context.Context, objects []interface{}, objectTyp
 	wg := sync.WaitGroup{}
 
 	// Start all workers.
-	for i := 0; i < s.Plugin.Config.Workers; i++ {
+	for i := 0; i < s.Plugin.Config.Common.Workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -245,7 +203,7 @@ func (s *Service) schedule(ctx context.Context, objects []interface{}, objectTyp
 				default:
 				}
 
-				data, err := s.transformer.Transform(ctx, objectType, obj)
+				data, err := s.transformer.Transform(ctx, objectType, common.ToInterfaceMap(obj).(map[string]interface{}))
 				if err != nil {
 					resCh <- workResult{
 						Object: obj,
@@ -257,7 +215,7 @@ func (s *Service) schedule(ctx context.Context, objects []interface{}, objectTyp
 				err = s.Plugin.RedisClient.Request(StoreRequest{
 					ObjectType: objectType,
 					Object:     data,
-					TTL:        s.Plugin.Config.TTL,
+					TTL:        s.Plugin.Config.ClientConfig.TTL,
 				})
 				if err != nil {
 					resCh <- workResult{
@@ -266,7 +224,7 @@ func (s *Service) schedule(ctx context.Context, objects []interface{}, objectTyp
 					}
 					continue
 				}
-				
+
 				// Send success result
 				resCh <- workResult{
 					Object: obj,
@@ -318,7 +276,7 @@ func (s *Service) schedule(ctx context.Context, objects []interface{}, objectTyp
 }
 
 func (s *Service) getAllDatabases(ctx context.Context) ([]*types.Database, error) {
-	searchCtx, cancel := context.WithTimeout(ctx, s.Plugin.Config.Timeout)
+	searchCtx, cancel := context.WithTimeout(ctx, s.Plugin.Config.Common.RuntimeTimeout)
 	defer cancel()
 
 	ch := s.Plugin.NotionClient.Registry.Search().Stream(searchCtx, types.SearchRequest{
@@ -333,7 +291,7 @@ func (s *Service) getAllDatabases(ctx context.Context) ([]*types.Database, error
 	for result := range ch {
 		if result.Error != nil {
 			if result.Error == context.DeadlineExceeded {
-				return databases, fmt.Errorf("search timeout after %v", s.Plugin.Config.Timeout)
+				return databases, fmt.Errorf("search timeout after %v", s.Plugin.Config.Common.RuntimeTimeout)
 			}
 			return databases, result.Error
 		}
@@ -354,7 +312,7 @@ func (s *Service) getDatabase(ctx context.Context, databaseID types.DatabaseID) 
 }
 
 func (s *Service) getPagesFromDatabase(ctx context.Context, databaseID types.DatabaseID) ([]*types.Page, error) {
-	queryCtx, cancel := context.WithTimeout(ctx, s.Plugin.Config.Timeout)
+	queryCtx, cancel := context.WithTimeout(ctx, s.Plugin.Config.Common.RuntimeTimeout)
 	defer cancel()
 
 	ch := s.Plugin.NotionClient.Registry.Databases().Query(queryCtx, databaseID, nil, nil)
@@ -363,7 +321,7 @@ func (s *Service) getPagesFromDatabase(ctx context.Context, databaseID types.Dat
 	for result := range ch {
 		if result.Error != nil {
 			if result.Error == context.DeadlineExceeded {
-				return pages, fmt.Errorf("database query timeout after %v", s.Plugin.Config.Timeout)
+				return pages, fmt.Errorf("database query timeout after %v", s.Plugin.Config.Common.RuntimeTimeout)
 			}
 			return pages, result.Error
 		}
@@ -379,22 +337,6 @@ func (s *Service) getPage(ctx context.Context, pageID types.PageID) (*types.Page
 		return nil, result.Error
 	}
 	return &result.Data, nil
-}
-
-func (s *Service) exportDatabases(ctx context.Context, databases []*types.Database) (*ExportResult, error) {
-	objects := make([]interface{}, len(databases))
-	for i, db := range databases {
-		objects[i] = db
-	}
-	return s.schedule(ctx, objects, types.ObjectTypeDatabase)
-}
-
-func (s *Service) exportPages(ctx context.Context, pages []*types.Page) (*ExportResult, error) {
-	objects := make([]interface{}, len(pages))
-	for i, page := range pages {
-		objects[i] = page
-	}
-	return s.schedule(ctx, objects, types.ObjectTypePage)
 }
 
 // exportPageBlocks exports all blocks from a specific page.
@@ -421,23 +363,6 @@ func (s *Service) exportPageBlocks(ctx context.Context, pageID types.PageID) (*E
 	}
 
 	return s.schedule(ctx, objects, types.ObjectTypeBlock)
-}
-
-// CreateIndex creates an index for the given index name and index type.
-func (s *Service) CreateIndex(ctx context.Context) error {
-	idx := s.Plugin.RedisClient.client.Do(ctx, s.Plugin.RedisClient.client.FTCreate(ctx, "notion:page", &red.FTCreateOptions{
-		OnJSON: true,
-		Prefix: []interface{}{"notion:page"},
-	}, &red.FieldSchema{
-		FieldName: "$.title",
-		FieldType: red.SearchFieldTypeText,
-		Sortable:  true,
-		As:        "title",
-	}))
-	if idx.Err() != nil {
-		return idx.Err()
-	}
-	return nil
 }
 
 // Close cleans up the export service.

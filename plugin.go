@@ -5,15 +5,13 @@ package redis
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/notioncodes/client"
 	"github.com/notioncodes/plugin"
-	"github.com/notioncodes/types"
 )
 
-// RedisPlugin is the plugin container.
-type RedisPlugin struct {
+// Pugin is the plugin container.
+type Pugin struct {
 	Base         plugin.Base
 	NotionClient *client.Client
 	RedisClient  *Client
@@ -25,32 +23,13 @@ type RedisPlugin struct {
 // Config is the configuration container for this plugin.
 type Config struct {
 	// Embed the base plugin configuration.
-	plugin.BaseConfig
+	plugin.Config
 
 	// Configuration for connecting to a redis
 	ClientConfig
 
-	// Concurrency settings
-	Workers   int           `json:"workers" yaml:"workers"`
-	BatchSize int           `json:"batch_size" yaml:"batch_size"`
-	Timeout   time.Duration `json:"timeout" yaml:"timeout"`
-	RateLimit int           `json:"rate_limit" yaml:"rate_limit"` // requests per second
-
-	// Export options
-	ObjectTypes   []types.ObjectType `json:"object_types" yaml:"object_types"`
-	IncludeBlocks bool               `json:"include_blocks" yaml:"include_blocks"`
-
-	// Progress tracking
-	EnableProgress    bool          `json:"enable_progress" yaml:"enable_progress"`
-	ProgressInterval  time.Duration `json:"progress_interval" yaml:"progress_interval"`     // Time-based debouncing
-	ProgressBatchSize int           `json:"progress_batch_size" yaml:"progress_batch_size"` // Count-based debouncing
-
-	// Error handling
-	ContinueOnError bool `json:"continue_on_error" yaml:"continue_on_error"`
-	MaxErrors       int  `json:"max_errors" yaml:"max_errors"`
-
-	// Flush
-	Flush bool `json:"flush" yaml:"flush"`
+	Common  plugin.CommonSettings  `json:"general" yaml:"general"`
+	Content plugin.ContentSettings `json:"content" yaml:"content"`
 }
 
 // NewPlugin creates a new Redis plugin.
@@ -62,7 +41,7 @@ type Config struct {
 // Returns:
 // - The Redis plugin instance.
 // - An error if plugin initialization fails.
-func NewPlugin(notionClient *client.Client, config Config) (*RedisPlugin, error) {
+func NewPlugin(notionClient *client.Client, config Config) (*Pugin, error) {
 	// pluginConfig := &PluginConfig{
 	// 	Workers:         4,
 	// 	BatchSize:       50,
@@ -76,11 +55,11 @@ func NewPlugin(notionClient *client.Client, config Config) (*RedisPlugin, error)
 
 	// Create a new Redis client
 
-	plugin := &RedisPlugin{
-		Base:         *plugin.NewPlugin(config.BaseConfig),
+	plugin := &Pugin{
+		Base:         *plugin.NewPlugin(config.Config),
 		NotionClient: notionClient,
 		Config:       config,
-		Flush:        config.Flush,
+		Flush:        config.Content.Flush,
 	}
 
 	var err error

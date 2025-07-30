@@ -3,6 +3,7 @@ module github.com/notioncodes/plugin-redis
 go 1.24.2
 
 require (
+	github.com/mateothegreat/go-multilog v0.0.0-20250627190626-359729313052
 	github.com/notioncodes/client v0.1.0
 	github.com/notioncodes/common v0.0.0-20250729003724-1647aef28a64
 	github.com/notioncodes/plugin v0.0.0-20250729003550-6ddd14124e91
@@ -19,7 +20,7 @@ require (
 	github.com/go-logr/logr v1.4.2 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
-	github.com/mateothegreat/go-multilog v0.0.0-20250627190626-359729313052 // indirect
+	github.com/kr/text v0.2.0 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/notioncodes/id v0.0.0-20250727200046-49fb310b2e53 // indirect
