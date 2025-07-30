@@ -39,7 +39,7 @@ type Config struct {
 // - The Redis plugin instance.
 // - An error if plugin initialization fails.
 func NewPlugin(pluginConfig Config) (*Plugin, error) {
-	notionClient, err := client.New(&client.Config{
+	notionClient, err := client.NewClient(&client.Config{
 		APIKey:        test.TestConfig.NotionAPIKey,
 		EnableMetrics: true,
 		RequestDelay:  pluginConfig.Common.RequestDelay,
