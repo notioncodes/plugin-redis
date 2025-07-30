@@ -12,7 +12,6 @@ import (
 	"github.com/mateothegreat/go-multilog/multilog"
 
 	"github.com/notioncodes/client"
-	"github.com/notioncodes/common"
 	"github.com/notioncodes/types"
 )
 
@@ -92,13 +91,17 @@ func (s *Service) Export(ctx context.Context) (*ExportResult, error) {
 						Object:     data,
 						TTL:        s.Plugin.Config.ClientConfig.TTL,
 					})
-
-					// pageResult, err := s.schedule(ctx, []interface{}{data}, types.ObjectTypePage)
-					// if err != nil && !s.Plugin.Config.ContinueOnError {
-					// 	s.result.Errored(types.ObjectTypeDatabase, db.ID.String(), err)
-					// 	return
-					// }
-					// s.result.Successful(types.ObjectTypePage, pageResult)
+					if err != nil {
+						s.result.Errored(types.ObjectTypePage, page.ID.String(), err)
+						if !s.Plugin.Config.Common.ContinueOnError {
+							return
+						}
+					} else {
+						// Count successful page exports
+						s.result.mu.Lock()
+						s.result.Success[types.ObjectTypePage]++
+						s.result.mu.Unlock()
+					}
 				}
 
 				// Export blocks from pages if enabled.
@@ -203,7 +206,7 @@ func (s *Service) schedule(ctx context.Context, objects []interface{}, objectTyp
 				default:
 				}
 
-				data, err := s.transformer.Transform(ctx, objectType, common.ToInterfaceMap(obj).(map[string]interface{}))
+				data, err := s.transformer.Transform(ctx, objectType, obj)
 				if err != nil {
 					resCh <- workResult{
 						Object: obj,
@@ -325,6 +328,12 @@ func (s *Service) getPagesFromDatabase(ctx context.Context, databaseID types.Dat
 			}
 			return pages, result.Error
 		}
+
+		multilog.Info("getPagesFromDatabase", "got page from database", map[string]interface{}{
+			"pageID": result.Data.ID.String(),
+			"object": result.Data.Object,
+		})
+
 		pages = append(pages, &result.Data)
 	}
 
@@ -341,8 +350,18 @@ func (s *Service) getPage(ctx context.Context, pageID types.PageID) (*types.Page
 
 // exportPageBlocks exports all blocks from a specific page.
 func (s *Service) exportPageBlocks(ctx context.Context, pageID types.PageID) (*ExportResult, error) {
-	// Convert PageID to BlockID since pages can be treated as blocks for getting their children
-	blockID := types.BlockID(pageID)
+	multilog.Info("exportPageBlocks", "getting blocks for page", map[string]interface{}{
+		"pageID": pageID.String(),
+	})
+
+	// Use the page ID directly - blocks API should accept page IDs with dashes
+	blockID := types.BlockID(pageID.String())
+
+	multilog.Info("exportPageBlocks", "constructed block request", map[string]interface{}{
+		"pageID":  pageID.String(),
+		"blockID": string(blockID),
+		"url":     "/v1/blocks/" + string(blockID) + "/children",
+	})
 
 	// Get page blocks using the new GetChildren API
 	ch := s.Plugin.NotionClient.Registry.Blocks().GetChildren(ctx, blockID)
