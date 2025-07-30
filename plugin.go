@@ -5,13 +5,15 @@ package redis
 import (
 	"context"
 	"fmt"
+	"log"
 
 	"github.com/notioncodes/client"
 	"github.com/notioncodes/plugin"
+	"github.com/notioncodes/test"
 )
 
-// Pugin is the plugin container.
-type Pugin struct {
+// Plugin is the plugin container.
+type Plugin struct {
 	Base         plugin.Base
 	NotionClient *client.Client
 	RedisClient  *Client
@@ -22,12 +24,8 @@ type Pugin struct {
 
 // Config is the configuration container for this plugin.
 type Config struct {
-	// Embed the base plugin configuration.
 	plugin.Config
-
-	// Configuration for connecting to a redis
 	ClientConfig
-
 	Common  plugin.CommonSettings  `json:"general" yaml:"general"`
 	Content plugin.ContentSettings `json:"content" yaml:"content"`
 }
@@ -35,34 +33,29 @@ type Config struct {
 // NewPlugin creates a new Redis plugin.
 //
 // Arguments:
-// - client: Instance of the Notion client from the `github.com/notioncodes/client` package.
-// - redisConfig: The Redis configuration.
+// - config: The Redis plugin configuration.
 //
 // Returns:
 // - The Redis plugin instance.
 // - An error if plugin initialization fails.
-func NewPlugin(notionClient *client.Client, config Config) (*Pugin, error) {
-	// pluginConfig := &PluginConfig{
-	// 	Workers:         4,
-	// 	BatchSize:       50,
-	// 	Timeout:         10 * time.Second, // Reduced timeout for faster operations
-	// 	RateLimit:       100,
-	// 	ObjectTypes:     []types.ObjectType{types.ObjectTypePage, types.ObjectTypeDatabase},
-	// 	IncludeBlocks:   true,
-	// 	ContinueOnError: true,
-	// 	MaxErrors:       10,
-	// }
+func NewPlugin(pluginConfig Config) (*Plugin, error) {
+	notionClient, err := client.New(&client.Config{
+		APIKey:        test.TestConfig.NotionAPIKey,
+		EnableMetrics: true,
+		RequestDelay:  pluginConfig.Common.RequestDelay,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer notionClient.Close()
 
-	// Create a new Redis client
-
-	plugin := &Pugin{
-		Base:         *plugin.NewPlugin(config.Config),
+	plugin := &Plugin{
+		Base:         *plugin.NewPlugin(pluginConfig.Config),
 		NotionClient: notionClient,
-		Config:       config,
-		Flush:        config.Content.Flush,
+		Config:       pluginConfig,
+		Flush:        pluginConfig.Content.Flush,
 	}
 
-	var err error
 	plugin.RedisClient, err = NewRedisClient(context.Background(), plugin)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Redis client: %w", err)

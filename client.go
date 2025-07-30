@@ -18,7 +18,7 @@ import (
 // Client is a wrapper around the rueidis client.
 type Client struct {
 	client *red.Client
-	plugin *Pugin
+	plugin *Plugin
 	wg     sync.WaitGroup
 	ch     chan StoreRequest
 	ctx    context.Context
@@ -200,7 +200,7 @@ func (c *Client) CreateIndex(ctx context.Context) error {
 // Returns:
 // - The Redis client instance.
 // - An error if the Redis client creation fails.
-func NewRedisClient(ctx context.Context, plugin *Pugin) (*Client, error) {
+func NewRedisClient(ctx context.Context, plugin *Plugin) (*Client, error) {
 	client := red.NewClient(&red.Options{
 		Addr:     plugin.Config.ClientConfig.Address,
 		Username: plugin.Config.ClientConfig.Username,

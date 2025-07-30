@@ -18,7 +18,7 @@ import (
 // Service provides high-level Redis export functionality with
 // concurrent processing and batch operations for efficient Notion data export.
 type Service struct {
-	Plugin      *Pugin
+	Plugin      *Plugin
 	transformer *Transformer
 	result      *ExportResult
 	wg          sync.WaitGroup
@@ -34,7 +34,7 @@ type Service struct {
 // Returns:
 // - The Redis service instance.
 // - An error if the Redis service creation fails.
-func NewService(plugin *Pugin) (*Service, error) {
+func NewService(plugin *Plugin) (*Service, error) {
 	return &Service{
 		Plugin:      plugin,
 		transformer: NewTransformer(plugin),
@@ -181,11 +181,6 @@ func (s *Service) ExportPage(ctx context.Context, pageID types.PageID, includeBl
 func (s *Service) schedule(ctx context.Context, objects []interface{}, objectType types.ObjectType) (*ExportResult, error) {
 	result := NewExportResult()
 
-	multilog.Info("schedule", "queueing objects", map[string]interface{}{
-		"objectType": objectType,
-		"objects":    len(objects),
-	})
-
 	objCh := make(chan interface{}, len(objects))
 	resCh := make(chan workResult, len(objects))
 	wg := sync.WaitGroup{}
@@ -263,11 +258,17 @@ func (s *Service) schedule(ctx context.Context, objects []interface{}, objectTyp
 			result.Success[objectType]++
 		}
 
+		httpMetrics := s.Plugin.NotionClient.GetMetrics()
 		s.Plugin.Base.Reporter.Report(map[string]interface{}{
-			"objectType": objectType,
-			"successful": result.Success,
-			"errors":     len(result.Errors),
-			"total":      len(objects),
+			"objectType":               objectType,
+			"successful":               result.Success,
+			"errors":                   len(result.Errors),
+			"total":                    result.Total(),
+			"http_throttled":           httpMetrics.ThrottleWaits,
+			"http_retries":             httpMetrics.TotalRetries,
+			"http_errors":              httpMetrics.TotalErrors,
+			"http_requests":            httpMetrics.TotalRequests,
+			"http_requests_per_second": httpMetrics.RequestsPerSecond,
 		})
 	}
 
@@ -275,8 +276,14 @@ func (s *Service) schedule(ctx context.Context, objects []interface{}, objectTyp
 }
 
 func (s *Service) getAllDatabases(ctx context.Context) ([]*types.Database, error) {
-	searchCtx, cancel := context.WithTimeout(ctx, s.Plugin.Config.Common.RuntimeTimeout)
-	defer cancel()
+	searchCtx := ctx
+	var cancel context.CancelFunc
+	if s.Plugin.Config.Common.RuntimeTimeout > 0 {
+		searchCtx, cancel = context.WithTimeout(ctx, s.Plugin.Config.Common.RuntimeTimeout)
+	}
+	if cancel != nil {
+		defer cancel()
+	}
 
 	ch := s.Plugin.NotionClient.Registry.Search().Stream(searchCtx, types.SearchRequest{
 		Query: "",
@@ -311,8 +318,14 @@ func (s *Service) getDatabase(ctx context.Context, databaseID types.DatabaseID) 
 }
 
 func (s *Service) getPagesFromDatabase(ctx context.Context, databaseID types.DatabaseID) ([]*types.Page, error) {
-	queryCtx, cancel := context.WithTimeout(ctx, s.Plugin.Config.Common.RuntimeTimeout)
-	defer cancel()
+	queryCtx := ctx
+	var cancel context.CancelFunc
+	if s.Plugin.Config.Common.RuntimeTimeout > 0 {
+		queryCtx, cancel = context.WithTimeout(ctx, s.Plugin.Config.Common.RuntimeTimeout)
+	}
+	if cancel != nil {
+		defer cancel()
+	}
 
 	ch := s.Plugin.NotionClient.Registry.Databases().Query(queryCtx, databaseID, nil, nil)
 
@@ -340,32 +353,16 @@ func (s *Service) getPage(ctx context.Context, pageID types.PageID) (*types.Page
 
 // exportPageBlocks exports all blocks from a specific page.
 func (s *Service) exportPageBlocks(ctx context.Context, pageID types.PageID) (*ExportResult, error) {
-	multilog.Info("exportPageBlocks", "getting blocks for page", map[string]interface{}{
-		"pageID": pageID.String(),
-	})
-
-	// Use the page ID directly - blocks API should accept page IDs with dashes
-	blockID := types.BlockID(pageID.String())
-
-	multilog.Info("exportPageBlocks", "constructed block request", map[string]interface{}{
-		"pageID":  pageID.String(),
-		"blockID": string(blockID),
-		"url":     "/v1/blocks/" + string(blockID) + "/children",
-	})
-
-	// Get page blocks using the new GetChildren API
-	ch := s.Plugin.NotionClient.Registry.Blocks().GetChildren(ctx, blockID)
+	ch := s.Plugin.NotionClient.Registry.Blocks().GetChildren(ctx, types.BlockID(pageID.String()))
 
 	var blocks []*types.Block
 	for result := range ch {
 		if result.Error != nil {
-			// Return error if we can't get blocks
 			return NewExportResult(), result.Error
 		}
 		blocks = append(blocks, &result.Data)
 	}
 
-	// Export the blocks
 	objects := make([]interface{}, len(blocks))
 	for i, block := range blocks {
 		objects[i] = block
@@ -413,6 +410,12 @@ type ExportResult struct {
 	mu       sync.RWMutex
 }
 
+// Errored adds an error to the export result.
+//
+// Arguments:
+// - objectType: The type of object that errored.
+// - objectID: The ID of the object that errored.
+// - err: The error that occurred.
 func (e *ExportResult) Errored(objectType types.ObjectType, objectID string, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -424,10 +427,30 @@ func (e *ExportResult) Errored(objectType types.ObjectType, objectID string, err
 	})
 }
 
+// Successful adds a successful export to the export result.
+//
+// Arguments:
+// - objectType: The type of object that was exported.
+// - r: The export result for the object.
 func (e *ExportResult) Successful(objectType types.ObjectType, r *ExportResult) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	e.Success[objectType] += r.Success[objectType]
 	e.Errors = append(e.Errors, r.Errors...)
+}
+
+// Total returns the total number of objects exported.
+//
+// Returns:
+// - The total number of objects exported.
+func (e *ExportResult) Total() int {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	var total int
+	for _, count := range e.Success {
+		total += count
+	}
+	return total + len(e.Errors)
 }

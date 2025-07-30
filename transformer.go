@@ -11,7 +11,7 @@ import (
 // Transformer is responsible for transforming the object into a format that
 // can be stored in Redis.
 type Transformer struct {
-	plugin *Pugin
+	plugin *Plugin
 }
 
 // NewTransformer creates a new Transformer instance.
@@ -21,7 +21,7 @@ type Transformer struct {
 //
 // Returns:
 // - The Transformer instance.
-func NewTransformer(plugin *Pugin) *Transformer {
+func NewTransformer(plugin *Plugin) *Transformer {
 	return &Transformer{
 		plugin: plugin,
 	}
