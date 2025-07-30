@@ -405,11 +405,12 @@ func NewExportResult() *ExportResult {
 
 // ExportResult contains the results of an export operation.
 type ExportResult struct {
-	Start   time.Time                `json:"start"`
-	End     time.Time                `json:"end"`
-	Success map[types.ObjectType]int `json:"success"`
-	Errors  []ExportError            `json:"errors,omitempty"`
-	mu      sync.RWMutex
+	Start    time.Time                `json:"start"`
+	End      time.Time                `json:"end"`
+	Success  map[types.ObjectType]int `json:"success"`
+	Requests int                      `json:"requests"`
+	Errors   []ExportError            `json:"errors,omitempty"`
+	mu       sync.RWMutex
 }
 
 func (e *ExportResult) Errored(objectType types.ObjectType, objectID string, err error) {
