@@ -15,10 +15,10 @@ import (
 // Service provides high-level Redis export functionality with
 // concurrent processing and batch operations for efficient Notion data export.
 type Service struct {
-	Plugin         *Plugin
-	transformer    *Transformer
-	exportService  *client.ExportService
-	result         *ExportResult
+	Plugin        *Plugin
+	transformer   *Transformer
+	exportService *client.ExportService
+	result        *ExportResult
 }
 
 // NewService creates a new Redis service instance.
@@ -178,46 +178,57 @@ func (s *Service) ExportBlock(ctx context.Context, blockID types.BlockID, includ
 // Returns:
 // - The export result.
 // - An error if the export operation fails.
-func (s *Service) Export(ctx context.Context) (*ExportResult, error) {
+func (s *Service) Export(ctx context.Context, opts client.ExportOptions) (*ExportResult, error) {
 	s.result.Start = time.Now()
 	defer func() {
 		s.result.End = time.Now()
 	}()
 
-	// Export databases if configured
-	for _, databaseID := range s.Plugin.Config.Content.Databases.IDs {
-		dbResult, err := s.ExportDatabase(ctx, databaseID,
-			s.Plugin.Config.Content.Databases.Pages,
-			s.Plugin.Config.Content.Databases.Blocks,
-			s.Plugin.Config.Content.Pages.Comments)
-		if err != nil {
-			if !s.Plugin.Config.Common.ContinueOnError {
-				return s.result, fmt.Errorf("failed to export database %s: %w", databaseID, err)
-			}
-			// Record error but continue
-			s.result.Errored(types.ObjectTypeDatabase, databaseID.String(), err)
-		} else {
-			// Merge results
-			s.result.Successful(types.ObjectTypeDatabase, dbResult)
+	result, err := s.exportService.Export(ctx, opts)
+	if err != nil {
+		return s.result, fmt.Errorf("failed to export: %w", err)
+	}
+
+	for _, databaseResult := range result.Databases {
+		if err := s.storeDatabaseResult(ctx, databaseResult); err != nil {
+			return s.result, fmt.Errorf("failed to store database result: %w", err)
 		}
 	}
 
-	// Export specific pages if configured
-	for _, pageID := range s.Plugin.Config.Content.Pages.IDs {
-		pageResult, err := s.ExportPage(ctx, pageID,
-			s.Plugin.Config.Content.Pages.Blocks,
-			s.Plugin.Config.Content.Pages.Comments)
-		if err != nil {
-			if !s.Plugin.Config.Common.ContinueOnError {
-				return s.result, fmt.Errorf("failed to export page %s: %w", pageID, err)
-			}
-			// Record error but continue
-			s.result.Errored(types.ObjectTypePage, pageID.String(), err)
-		} else {
-			// Merge results
-			s.result.Successful(types.ObjectTypePage, pageResult)
-		}
-	}
+	// // Export databases if configured
+	// for _, databaseID := range s.Plugin.Config.Content.Databases.IDs {
+	// 	dbResult, err := s.ExportDatabase(ctx, databaseID,
+	// 		s.Plugin.Config.Content.Databases.Pages,
+	// 		s.Plugin.Config.Content.Databases.Blocks,
+	// 		s.Plugin.Config.Content.Pages.Comments)
+	// 	if err != nil {
+	// 		if !s.Plugin.Config.Common.ContinueOnError {
+	// 			return s.result, fmt.Errorf("failed to export database %s: %w", databaseID, err)
+	// 		}
+	// 		// Record error but continue
+	// 		s.result.Errored(types.ObjectTypeDatabase, databaseID.String(), err)
+	// 	} else {
+	// 		// Merge results
+	// 		s.result.Successful(types.ObjectTypeDatabase, dbResult)
+	// 	}
+	// }
+
+	// // Export specific pages if configured
+	// for _, pageID := range s.Plugin.Config.Content.Pages.IDs {
+	// 	pageResult, err := s.ExportPage(ctx, pageID,
+	// 		s.Plugin.Config.Content.Pages.Blocks,
+	// 		s.Plugin.Config.Content.Pages.Comments)
+	// 	if err != nil {
+	// 		if !s.Plugin.Config.Common.ContinueOnError {
+	// 			return s.result, fmt.Errorf("failed to export page %s: %w", pageID, err)
+	// 		}
+	// 		// Record error but continue
+	// 		s.result.Errored(types.ObjectTypePage, pageID.String(), err)
+	// 	} else {
+	// 		// Merge results
+	// 		s.result.Successful(types.ObjectTypePage, pageResult)
+	// 	}
+	// }
 
 	return s.result, nil
 }
@@ -392,7 +403,7 @@ func (e *ExportResult) Successful(objectType types.ObjectType, r *ExportResult) 
 	for objType, count := range r.Success {
 		e.Success[objType] += count
 	}
-	
+
 	// Merge errors
 	e.Errors = append(e.Errors, r.Errors...)
 }
